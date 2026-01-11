@@ -251,6 +251,62 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 			if msg.SessionID == sess.ID && msg.Role == message.Assistant && len(msg.Parts) > 0 {
 				stopSpinner()
 
+				// Output reasoning content
+				if reasoning := msg.ReasoningContent(); reasoning.Thinking != "" {
+					reasoningBytes := messageReadBytes["reasoning:"+msg.ID]
+					if len(reasoning.Thinking) > reasoningBytes {
+						newThinking := reasoning.Thinking[reasoningBytes:]
+						if reasoningBytes == 0 {
+							fmt.Fprintln(output, "[Thinking]")
+						}
+						fmt.Fprint(output, newThinking)
+						if !strings.HasSuffix(newThinking, "\n") {
+							fmt.Fprint(output)
+						}
+						messageReadBytes["reasoning:"+msg.ID] = len(reasoning.Thinking)
+					}
+				}
+
+				// Output tool calls with streaming input
+				for _, tc := range msg.ToolCalls() {
+					tcKey := "toolcall:" + tc.ID
+					inputReadBytes := messageReadBytes[tcKey]
+
+					if len(tc.Input) > inputReadBytes {
+						if inputReadBytes == 0 {
+							fmt.Fprintf(output, "[Tool call: %s]\n", tc.Name)
+						}
+						newInput := tc.Input[inputReadBytes:]
+						fmt.Fprint(output, newInput)
+						if tc.Finished {
+							if !strings.HasSuffix(tc.Input, "\n") {
+								fmt.Fprintln(output)
+							}
+							fmt.Fprintln(output)
+						}
+						messageReadBytes[tcKey] = len(tc.Input)
+					}
+				}
+
+				// Output tool results
+				for _, tr := range msg.ToolResults() {
+					trKey := "toolresult:" + msg.ID + ":" + tr.ToolCallID
+					if _, seen := messageReadBytes[trKey]; !seen {
+						if tr.IsError {
+							fmt.Fprintf(output, "[Tool error: %s]\n", tr.Name)
+						} else {
+							fmt.Fprintf(output, "[Tool result: %s]\n", tr.Name)
+						}
+						fmt.Fprint(output, tr.Content)
+						if tr.Content != "" && !strings.HasSuffix(tr.Content, "\n") {
+							fmt.Fprintln(output)
+						}
+						fmt.Fprintln(output)
+						messageReadBytes[trKey] = 1
+					}
+				}
+
+				// Output text content
 				content := msg.Content().String()
 				readBytes := messageReadBytes[msg.ID]
 
@@ -260,9 +316,8 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				}
 
 				part := content[readBytes:]
-				// Trim leading whitespace. Sometimes the LLM includes leading
-				// formatting and intentation, which we don't want here.
-				if readBytes == 0 {
+				if readBytes == 0 && msg.ReasoningContent().Thinking == "" && len(msg.ToolCalls()) == 0 && len(msg.ToolResults()) == 0 {
+					// Only trim leading whitespace if this is the first content and we don't have other parts
 					part = strings.TrimLeft(part, " \t")
 				}
 				fmt.Fprint(output, part)
