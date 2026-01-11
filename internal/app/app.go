@@ -122,6 +122,50 @@ func (app *App) Config() *config.Config {
 	return app.config
 }
 
+// writeStreamingContent writes streaming content to output, tracking bytes read
+// and printing a header on first write.
+func writeStreamingContent(
+	output io.Writer,
+	content string,
+	key string,
+	header string,
+	messageReadBytes map[string]int,
+	ensureNewline bool,
+) {
+	readBytes := messageReadBytes[key]
+	if len(content) <= readBytes {
+		return
+	}
+
+	newContent := content[readBytes:]
+	if readBytes == 0 && header != "" {
+		fmt.Fprintln(output, "")
+		fmt.Fprintln(output, header)
+	}
+	fmt.Fprint(output, newContent)
+	if ensureNewline && !strings.HasSuffix(newContent, "\n") {
+		fmt.Fprint(output)
+	}
+	messageReadBytes[key] = len(content)
+}
+
+// writeToolResult writes a tool result to output.
+func writeToolResult(output io.Writer, tr message.ToolResult, messageReadBytes map[string]int, msgID string) {
+	key := "toolresult:" + msgID + ":" + tr.ToolCallID
+	if _, seen := messageReadBytes[key]; seen {
+		return
+	}
+
+	header := fmt.Sprintf("[Tool %s: %s]", map[bool]string{true: "error", false: "result"}[tr.IsError], tr.Name)
+	fmt.Fprintln(output, header)
+	fmt.Fprint(output, tr.Content)
+	if tr.Content != "" && !strings.HasSuffix(tr.Content, "\n") {
+		fmt.Fprintln(output)
+	}
+	fmt.Fprintln(output)
+	messageReadBytes[key] = 1
+}
+
 // RunNonInteractive runs the application in non-interactive mode with the
 // given prompt, printing to stdout.
 func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt string, quiet bool) error {
@@ -253,57 +297,37 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 
 				// Output reasoning content
 				if reasoning := msg.ReasoningContent(); reasoning.Thinking != "" {
-					reasoningBytes := messageReadBytes["reasoning:"+msg.ID]
-					if len(reasoning.Thinking) > reasoningBytes {
-						newThinking := reasoning.Thinking[reasoningBytes:]
-						if reasoningBytes == 0 {
-							fmt.Fprintln(output, "[Thinking]")
-						}
-						fmt.Fprint(output, newThinking)
-						if !strings.HasSuffix(newThinking, "\n") {
-							fmt.Fprint(output)
-						}
-						messageReadBytes["reasoning:"+msg.ID] = len(reasoning.Thinking)
-					}
+					writeStreamingContent(
+						output,
+						reasoning.Thinking,
+						"reasoning:"+msg.ID,
+						"[Thinking]",
+						messageReadBytes,
+						true,
+					)
 				}
 
 				// Output tool calls with streaming input
 				for _, tc := range msg.ToolCalls() {
 					tcKey := "toolcall:" + tc.ID
-					inputReadBytes := messageReadBytes[tcKey]
-
-					if len(tc.Input) > inputReadBytes {
-						if inputReadBytes == 0 {
-							fmt.Fprintf(output, "[Tool call: %s]\n", tc.Name)
-						}
-						newInput := tc.Input[inputReadBytes:]
-						fmt.Fprint(output, newInput)
+					if len(tc.Input) > messageReadBytes[tcKey] {
+						writeStreamingContent(
+							output,
+							tc.Input,
+							tcKey,
+							fmt.Sprintf("[Tool call: %s]", tc.Name),
+							messageReadBytes,
+							tc.Finished,
+						)
 						if tc.Finished {
-							if !strings.HasSuffix(tc.Input, "\n") {
-								fmt.Fprintln(output)
-							}
 							fmt.Fprintln(output)
 						}
-						messageReadBytes[tcKey] = len(tc.Input)
 					}
 				}
 
 				// Output tool results
 				for _, tr := range msg.ToolResults() {
-					trKey := "toolresult:" + msg.ID + ":" + tr.ToolCallID
-					if _, seen := messageReadBytes[trKey]; !seen {
-						if tr.IsError {
-							fmt.Fprintf(output, "[Tool error: %s]\n", tr.Name)
-						} else {
-							fmt.Fprintf(output, "[Tool result: %s]\n", tr.Name)
-						}
-						fmt.Fprint(output, tr.Content)
-						if tr.Content != "" && !strings.HasSuffix(tr.Content, "\n") {
-							fmt.Fprintln(output)
-						}
-						fmt.Fprintln(output)
-						messageReadBytes[trKey] = 1
-					}
+					writeToolResult(output, tr, messageReadBytes, msg.ID)
 				}
 
 				// Output text content
@@ -316,7 +340,8 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				}
 
 				part := content[readBytes:]
-				if readBytes == 0 && msg.ReasoningContent().Thinking == "" && len(msg.ToolCalls()) == 0 && len(msg.ToolResults()) == 0 {
+				hasOtherParts := msg.ReasoningContent().Thinking != "" || len(msg.ToolCalls()) > 0 || len(msg.ToolResults()) > 0
+				if readBytes == 0 && !hasOtherParts {
 					// Only trim leading whitespace if this is the first content and we don't have other parts
 					part = strings.TrimLeft(part, " \t")
 				}
